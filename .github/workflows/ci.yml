@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x bin/keepawake install.sh tests/run.sh
+      - name: unit tests
+        run: bash tests/run.sh
+      - name: CLI smoke
+        run: |
+          bin/keepawake --version
+          bin/keepawake --help >/dev/null
+          bin/keepawake completion | bash -n
+          ! bin/keepawake nonsense 2>/dev/null
+      - name: extension metadata
+        run: python3 -m json.tool gnome-extension/*/metadata.json >/dev/null

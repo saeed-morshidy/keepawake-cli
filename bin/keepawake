@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+#
+# keepawake — keep a Linux laptop awake for a while, on AC, on battery, or both.
+#
+# The work is done by a transient systemd user service that holds a
+# systemd-inhibit lock (sleep, idle, lid switch) while the power source matches
+# the chosen mode. The timer lives in a small state file, so it can be changed
+# while the service is running: `keepawake 2h` resets it, `keepawake +30m`
+# extends it, `keepawake 23:30` runs until a clock time.
+#
+# https://github.com/saeed-morshidy/keepawake-cli · MIT
+
+set -uo pipefail
+
+readonly VERSION="2.0.0"
+readonly UNIT="keepawake.service"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly SELF
+readonly STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/keepawake"
+readonly CONFIG="$STATE_DIR/config"   # written by the CLI:     MODE DEADLINE STARTED
+readonly RUNTIME="$STATE_DIR/runtime" # written by the service: PID PROTECTED POWER
+readonly WHY="keepawake: user request"
+readonly WHAT="sleep:idle:handle-lid-switch"
+
+QUIET=0
+
+# ─────────────────────────────────────────────────────────────── output ──
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then
+    B=$'\e[1m' D=$'\e[2m' R=$'\e[0m'
+    GRN=$'\e[32m' YLW=$'\e[33m' RED=$'\e[31m' CYN=$'\e[36m'
+else
+    B='' D='' R='' GRN='' YLW='' RED='' CYN=''
+fi
+
+say()  { (( QUIET )) || printf '%s\n' "$*"; }
+ok()   { (( QUIET )) || printf '%s✓%s %s\n' "$GRN" "$R" "$*"; }
+warn() { printf '%s!%s %s\n' "$YLW" "$R" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2; exit "${2:-1}"; }
+
+# 3725 -> "1h 02m", 125 -> "2m 05s", 42 -> "42s", 90061 -> "1d 01h"
+fmt_dur() {
+    local s=$1 d h m
+    (( s < 0 )) && s=0
+    d=$(( s / 86400 )) h=$(( s % 86400 / 3600 )) m=$(( s % 3600 / 60 ))
+    s=$(( s % 60 ))
+    if   (( d )); then printf '%dd %02dh' "$d" "$h"
+    elif (( h )); then printf '%dh %02dm' "$h" "$m"
+    elif (( m )); then printf '%dm %02ds' "$m" "$s"
+    else               printf '%ds' "$s"
+    fi
+}
+
+# Compact form for prompts and panels: 1h05m, 25m, 40s
+fmt_short() {
+    local s=$1
+    (( s < 0 )) && s=0
+    if   (( s >= 3600 )); then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+    elif (( s >= 60 ));   then printf '%dm' $(( (s + 59) / 60 ))
+    else                       printf '%ds' "$s"
+    fi
+}
+
+fmt_clock() {
+    local t=$1 fmt='%H:%M'
+    # Show the day when the deadline is not today.
+    [[ "$(date -d "@$t" +%F)" == "$(date +%F)" ]] || fmt='%a %H:%M'
+    date -d "@$t" +"$fmt"
+}
+
+# ──────────────────────────────────────────────────────────── durations ──
+
+# Prints seconds for: 90 (minutes), 45s, 30m, 2h, 1d, 1h30m, 2h15m30s
+parse_duration() {
+    local in=${1,,} total=0 n u
+    if [[ "$in" =~ ^[0-9]+$ ]]; then
+        (( 10#$in > 0 )) || return 1
+        echo $(( 10#$in * 60 ))
+        return
+    fi
+    [[ "$in" =~ ^([0-9]+[dhms])+$ ]] || return 1
+    while [[ "$in" =~ ^([0-9]+)([dhms])(.*)$ ]]; do
+        n=$(( 10#${BASH_REMATCH[1]} )) u=${BASH_REMATCH[2]} in=${BASH_REMATCH[3]}
+        case $u in
+            d) (( total += n * 86400 )) ;;
+            h) (( total += n * 3600 )) ;;
+            m) (( total += n * 60 )) ;;
+            s) (( total += n )) ;;
+        esac
+    done
+    (( total > 0 )) || return 1
+    echo "$total"
+}
+
+# Prints an epoch for a clock time or a date(1) expression.
+# A bare HH:MM that has already passed today means tomorrow.
+parse_clock() {
+    local expr=$1 t now
+    now=$(date +%s)
+    t=$(date -d "$expr" +%s 2>/dev/null) || return 1
+    if [[ "$expr" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] && (( t <= now )); then
+        t=$(date -d "tomorrow $expr" +%s) || return 1
+    fi
+    (( t > now )) || return 1
+    echo "$t"
+}
+
+# ───────────────────────────────────────────────────────────────── state ──
+
+CFG_MODE=both CFG_DEADLINE=0 CFG_STARTED=0
+RT_PROTECTED=0 RT_POWER=unknown
+
+read_kv() { # file prefix
+    local file=$1 prefix=$2 k v
+    [[ -r "$file" ]] || return 1
+    while IFS='=' read -r k v; do
+        [[ "$k" =~ ^[A-Z]+$ && "$v" =~ ^[a-z0-9]*$ ]] || continue
+        printf -v "${prefix}_$k" '%s' "$v"
+    done < "$file"
+}
+
+load_config()  { CFG_MODE=both CFG_DEADLINE=0 CFG_STARTED=0; read_kv "$CONFIG" CFG; }
+load_runtime() { RT_PROTECTED=0 RT_POWER=unknown;   read_kv "$RUNTIME" RT; }
+
+write_atomic() { # file, then lines
+    local file=$1 tmp
+    shift
+    mkdir -p "$STATE_DIR" || return 1
+    tmp=$(mktemp "$file.XXXXXX") || return 1
+    printf '%s\n' "$@" > "$tmp" && mv -f "$tmp" "$file"
+}
+
+save_config() {
+    write_atomic "$CONFIG" "MODE=$CFG_MODE" "DEADLINE=$CFG_DEADLINE" "STARTED=$CFG_STARTED"
+}
+
+is_running() { systemctl --user is-active --quiet "$UNIT"; }
+
+clean_stale() {
+    is_running || rm -f "$CONFIG" "$RUNTIME" 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────── power source ──
+
+power_source() {
+    local result path kind online found=0
+
+    if command -v busctl >/dev/null 2>&1; then
+        result=$(busctl --system get-property org.freedesktop.UPower \
+            /org/freedesktop/UPower org.freedesktop.UPower OnBattery 2>/dev/null)
+        case "$result" in
+            'b true')  echo battery; return ;;
+            'b false') echo ac; return ;;
+        esac
+    fi
+
+    for path in /sys/class/power_supply/*; do
+        [[ -r "$path/type" && -r "$path/online" ]] || continue
+        read -r kind < "$path/type"
+        case "$kind" in
+            Mains|USB|USB_C|USB_PD|USB_DCP|USB_CDP|USB_ACA|Wireless)
+                found=1
+                read -r online < "$path/online"
+                [[ "$online" == 1 ]] && { echo ac; return; }
+                ;;
+        esac
+    done
+    (( found )) && { echo battery; return; }
+
+    for path in /sys/class/power_supply/*; do
+        [[ -r "$path/type" && -r "$path/status" ]] || continue
+        read -r kind < "$path/type"
+        [[ "$kind" == Battery ]] || continue
+        read -r result < "$path/status"
+        case "$result" in
+            Discharging)   echo battery; return ;;
+            Charging|Full) echo ac; return ;;
+        esac
+    done
+
+    echo unknown
+}
+
+# ──────────────────────────────────────────────────── the service itself ──
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send --app-name=keepawake --icon=dialog-information-symbolic \
+        --hint=string:x-canonical-private-synchronous:keepawake "$@" 2>/dev/null || true
+}
+
+monitor() {
+    local block_pid='' protected=0 power now last=''
+
+    stop_block() {
+        if [[ -n "$block_pid" ]]; then
+            kill -- "-$block_pid" 2>/dev/null || kill "$block_pid" 2>/dev/null
+            wait "$block_pid" 2>/dev/null
+            block_pid=''
+        fi
+        protected=0
+    }
+    finish() {
+        stop_block
+        rm -f "$CONFIG" "$RUNTIME" 2>/dev/null
+    }
+
+    trap 'exit 0' TERM INT HUP
+    trap finish EXIT
+
+    load_config || { echo "keepawake: no config at $CONFIG" >&2; exit 1; }
+
+    while :; do
+        load_config || exit 0    # config removed: someone asked us to stop
+        now=$(date +%s)
+
+        if (( CFG_DEADLINE > 0 && now >= CFG_DEADLINE )); then
+            notify "Keepawake finished" "Normal power settings are back."
+            exit 0
+        fi
+
+        power=$(power_source)
+        if [[ "$CFG_MODE" == both || "$CFG_MODE" == "$power" ]]; then
+            if [[ -z "$block_pid" ]] || ! kill -0 "$block_pid" 2>/dev/null; then
+                block_pid=''
+                setsid systemd-inhibit --who=keepawake --why="$WHY" \
+                    --what="$WHAT" --mode=block sleep infinity &
+                block_pid=$!
+                sleep 0.2
+                if kill -0 "$block_pid" 2>/dev/null; then
+                    protected=1
+                else
+                    block_pid='' protected=0
+                    echo "keepawake: could not take the inhibitor lock" >&2
+                fi
+            fi
+        else
+            stop_block
+        fi
+
+        # Only touch the file when something changed, so watchers stay quiet.
+        if [[ "$protected:$power" != "$last" ]]; then
+            write_atomic "$RUNTIME" "PID=$$" "PROTECTED=$protected" "POWER=$power"
+            last="$protected:$power"
+        fi
+
+        sleep 1 & wait $!
+    done
+}
+
+# ─────────────────────────────────────────────────────────────── status ──
+
+mode_label() {
+    case $1 in
+        ac)      echo "AC only" ;;
+        battery) echo "battery only" ;;
+        *)       echo "AC + battery" ;;
+    esac
+}
+
+status_json() {
+    local now running=false protected=false remaining=null deadline=null
+    now=$(date +%s)
+    clean_stale
+    if is_running && load_config; then
+        load_runtime
+        running=true
+        (( RT_PROTECTED )) && protected=true
+        if (( CFG_DEADLINE > 0 )); then
+            deadline=$CFG_DEADLINE remaining=$(( CFG_DEADLINE - now ))
+            (( remaining < 0 )) && remaining=0
+        fi
+        printf '{"running":%s,"protected":%s,"mode":"%s","power":"%s","started":%s,"deadline":%s,"remaining":%s}\n' \
+            "$running" "$protected" "$CFG_MODE" "$RT_POWER" "$CFG_STARTED" "$deadline" "$remaining"
+    else
+        printf '{"running":false,"protected":false,"mode":null,"power":"%s","started":null,"deadline":null,"remaining":null}\n' \
+            "$(power_source)"
+    fi
+}
+
+# One word or a countdown — for prompts, tmux, conky.
+status_short() {
+    clean_stale
+    if is_running && load_config; then
+        load_runtime
+        if (( CFG_DEADLINE > 0 )); then
+            fmt_short $(( CFG_DEADLINE - $(date +%s) ))
+        else
+            printf '∞'
+        fi
+        (( RT_PROTECTED )) || printf ' (standby)'
+        echo
+    else
+        echo off
+        return 1
+    fi
+}
+
+status_human() {
+    local now left power
+    now=$(date +%s)
+    clean_stale
+
+    if ! is_running || ! load_config; then
+        power=$(power_source)
+        printf '%s○ keepawake%s  %soff%s — normal power settings\n' "$B" "$R" "$D" "$R"
+        printf '  %spower%s   %s\n' "$D" "$R" "$power"
+        return 3
+    fi
+
+    load_runtime
+    if (( RT_PROTECTED )); then
+        printf '%s●%s %skeepawake%s  %son%s · awake\n' "$GRN" "$R" "$B" "$R" "$GRN" "$R"
+    else
+        printf '%s●%s %skeepawake%s  %sstandby%s · waiting for %s power\n' \
+            "$YLW" "$R" "$B" "$R" "$YLW" "$R" "$( [[ $CFG_MODE == ac ]] && echo AC || echo battery )"
+    fi
+    printf '  %smode%s    %s %s(now on %s)%s\n' "$D" "$R" "$(mode_label "$CFG_MODE")" "$D" "$RT_POWER" "$R"
+    if (( CFG_DEADLINE > 0 )); then
+        left=$(( CFG_DEADLINE - now ))
+        printf '  %stime%s    %s%s%s left · until %s\n' "$D" "$R" "$CYN" "$(fmt_dur "$left")" "$R" "$(fmt_clock "$CFG_DEADLINE")"
+    else
+        printf '  %stime%s    %suntil you stop it%s\n' "$D" "$R" "$CYN" "$R"
+    fi
+    (( CFG_STARTED > 0 && now - CFG_STARTED >= 60 )) && printf '  %sfor%s     %s so far\n' "$D" "$R" "$(fmt_dur $(( now - CFG_STARTED )))"
+    return 0
+}
+
+watch_status() {
+    local lines=0 n
+    [[ -t 1 ]] || die "watch needs a terminal"
+    trap 'printf "\e[?25h"; exit 0' INT TERM
+    printf '\e[?25l'
+    while :; do
+        (( lines )) && printf '\e[%dA' "$lines"
+        out=$(status_human; echo x)
+        out=${out%x}
+        n=$(grep -c '' <<< "$out")
+        printf '%s' "$out" | sed 's/$/\x1b[K/'
+        lines=$(( n - 1 ))
+        (( lines < 1 )) && lines=1
+        sleep 1
+    done
+}
+
+# ────────────────────────────────────────────────────────────── actions ──
+
+need() {
+    local c
+    for c in systemctl systemd-run systemd-inhibit setsid; do
+        command -v "$c" >/dev/null 2>&1 || die "missing command: $c"
+    done
+}
+
+start_service() {
+    need
+    write_atomic "$CONFIG" "MODE=$CFG_MODE" "DEADLINE=$CFG_DEADLINE" "STARTED=$CFG_STARTED" \
+        || die "cannot write $CONFIG"
+    rm -f "$RUNTIME"
+
+    if ! systemd-run --user --quiet --collect --unit="${UNIT%.service}" \
+            --description="keepawake ($CFG_MODE)" \
+            --property=Type=exec --property=KillMode=control-group \
+            --property=TimeoutStopSec=4s \
+            "$SELF" __monitor >/dev/null; then
+        rm -f "$CONFIG"
+        die "could not start the user service (see: journalctl --user -u $UNIT)"
+    fi
+
+    # Wait briefly for the first state report so the summary is accurate.
+    for _ in {1..15}; do [[ -e "$RUNTIME" ]] && break; sleep 0.1; done
+}
+
+stop_service() {
+    clean_stale
+    if ! is_running; then
+        say "keepawake is already off."
+        return 0
+    fi
+    systemctl --user stop "$UNIT" || die "could not stop $UNIT"
+    rm -f "$CONFIG" "$RUNTIME"
+    ok "keepawake off — normal power settings are back."
+}
+
+# Applies TIME_KIND/TIME_VAL and NEW_MODE either to a fresh start or to the
+# running service.
+apply() {
+    local now running=0 msg=()
+    now=$(date +%s)
+    clean_stale
+    is_running && load_config && running=1
+
+    if (( ! running )); then
+        CFG_MODE=${NEW_MODE:-both} CFG_STARTED=$now CFG_DEADLINE=0
+        case $TIME_KIND in
+            set|extend) CFG_DEADLINE=$(( now + TIME_VAL )) ;;
+            at)         CFG_DEADLINE=$TIME_VAL ;;
+            shorten)    die "keepawake is not running — nothing to shorten" 2 ;;
+        esac
+        start_service
+        (( QUIET )) && return 0
+        ok "keepawake on"
+        status_human | tail -n +2
+        return 0
+    fi
+
+    if [[ -n "$NEW_MODE" && "$NEW_MODE" != "$CFG_MODE" ]]; then
+        CFG_MODE=$NEW_MODE
+        msg+=("mode → $(mode_label "$CFG_MODE")")
+    fi
+
+    case $TIME_KIND in
+        set)
+            CFG_DEADLINE=$(( now + TIME_VAL ))
+            msg+=("timer reset → $(fmt_dur "$TIME_VAL") from now")
+            ;;
+        at)
+            CFG_DEADLINE=$TIME_VAL
+            msg+=("timer → until $(fmt_clock "$TIME_VAL")")
+            ;;
+        forever)
+            CFG_DEADLINE=0
+            msg+=("timer removed → until you stop it")
+            ;;
+        extend)
+            if (( CFG_DEADLINE > 0 )); then
+                CFG_DEADLINE=$(( CFG_DEADLINE + TIME_VAL ))
+            else
+                CFG_DEADLINE=$(( now + TIME_VAL ))
+            fi
+            msg+=("extended by $(fmt_dur "$TIME_VAL")")
+            ;;
+        shorten)
+            (( CFG_DEADLINE > 0 )) || die "no timer to shorten (running until stopped)" 2
+            CFG_DEADLINE=$(( CFG_DEADLINE - TIME_VAL ))
+            if (( CFG_DEADLINE <= now )); then
+                stop_service
+                return 0
+            fi
+            msg+=("shortened by $(fmt_dur "$TIME_VAL")")
+            ;;
+    esac
+
+    if (( ${#msg[@]} == 0 )); then
+        status_human
+        return 0
+    fi
+
+    save_config || die "cannot write $CONFIG"
+    # Let the service pick up a mode change before reporting.
+    [[ -n "$NEW_MODE" ]] && sleep 1.2
+    (( QUIET )) && return 0
+    local m
+    for m in "${msg[@]}"; do ok "$m"; done
+    status_human | tail -n +2
+}
+
+# ───────────────────────────────────────────────────────────────── help ──
+
+usage() {
+    cat <<EOF
+${B}keepawake${R} $VERSION — keep this machine awake, for a while or until you stop it
+
+${B}Usage${R}
+  keepawake [TIME] [MODE]        start, or change the running timer/mode
+  keepawake stop | off           back to normal power settings
+  keepawake status [--json|--short]
+  keepawake watch                live status (Ctrl-C to leave)
+  keepawake toggle               on ↔ off
+
+${B}TIME${R}  (while running, it re-times the session — no restart)
+  30m  2h  1h30m  1d  90         run for that long (a bare number is minutes)
+  +15m  -10m                     extend or shorten the current timer
+  23:30   until "tomorrow 8am"   run until a clock time
+  forever                        no timer
+
+${B}MODE${R}
+  both (default)  ac  battery    stay awake only on that power source
+
+${B}Examples${R}
+  keepawake 2h                   two hours on any power
+  keepawake 45m ac               only while plugged in
+  keepawake 1h                   ${D}(running) restart the countdown at 1h${R}
+  keepawake +30m                 ${D}(running) add 30 minutes${R}
+  keepawake battery              ${D}(running) switch mode, keep the timer${R}
+
+${B}Options${R}
+  -q, --quiet    no output on success      -V, --version
+  -h, --help     this help                 NO_COLOR=1 disables colour
+
+Blocks: sleep, idle and lid-switch suspend, via systemd-inhibit.
+EOF
+}
+
+completion_bash() {
+    cat <<'EOF'
+_keepawake() {
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    case $prev in
+        status) COMPREPLY=($(compgen -W "--json --short" -- "$cur")); return ;;
+        completion) COMPREPLY=($(compgen -W "bash" -- "$cur")); return ;;
+        until) return ;;
+    esac
+    COMPREPLY=($(compgen -W "stop off status watch toggle on forever until
+        15m 30m 1h 2h 4h +15m +30m +1h -15m ac battery both
+        --quiet --help --version" -- "$cur"))
+}
+complete -F _keepawake keepawake
+EOF
+}
+
+# ───────────────────────────────────────────────────────────────── main ──
+
+main() {
+    local args=() a
+    TIME_KIND='' TIME_VAL=0 NEW_MODE=''
+
+    for a in "$@"; do
+        case $a in
+            -q|--quiet)   QUIET=1 ;;
+            -h|--help)    usage; return 0 ;;
+            -V|--version) echo "keepawake $VERSION"; return 0 ;;
+            *)            args+=("$a") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
+    case ${1:-} in
+        __monitor)  monitor; return ;;
+        stop|off)   stop_service; return ;;
+        status)
+            case ${2:-} in
+                --json|-j)  status_json ;;
+                --short|-s) status_short ;;
+                '')         status_human ;;
+                *)          die "unknown status option: $2" 2 ;;
+            esac
+            return
+            ;;
+        watch)      watch_status; return ;;
+        toggle)
+            clean_stale
+            if is_running; then stop_service; else TIME_KIND=forever; apply; fi
+            return
+            ;;
+        help)       usage; return 0 ;;
+        version)    echo "keepawake $VERSION"; return 0 ;;
+        completion) completion_bash; return 0 ;;
+        on|start)   shift ;;
+    esac
+
+    local secs t
+    while (( $# )); do
+        a=$1
+        shift
+        case ${a,,} in
+            ac|plug|plugged|charger) NEW_MODE=ac ;;
+            battery|bat)             NEW_MODE=battery ;;
+            both|any)                NEW_MODE=both ;;
+            forever|infinity|infinite|inf|∞) TIME_KIND=forever ;;
+            mode)
+                case ${1:-} in
+                    ac|battery|both) NEW_MODE=$1; shift ;;
+                    *) die "mode needs one of: ac, battery, both" 2 ;;
+                esac
+                ;;
+            until|at)
+                (( $# )) || die "until needs a time, e.g. until 23:30" 2
+                t=$(parse_clock "$*") || die "can't read that as a future time: $*" 2
+                TIME_KIND=at TIME_VAL=$t
+                set --
+                ;;
+            +*)
+                secs=$(parse_duration "${a#+}") || die "bad duration: $a" 2
+                TIME_KIND=extend TIME_VAL=$secs
+                ;;
+            -*)
+                secs=$(parse_duration "${a#-}") || die "unknown option or duration: $a" 2
+                TIME_KIND=shorten TIME_VAL=$secs
+                ;;
+            *:*)
+                t=$(parse_clock "$a") || die "can't read that as a future time: $a" 2
+                TIME_KIND=at TIME_VAL=$t
+                ;;
+            *)
+                secs=$(parse_duration "$a") \
+                    || die "don't understand '$a' — try: keepawake --help" 2
+                TIME_KIND=set TIME_VAL=$secs
+                ;;
+        esac
+    done
+
+    # Plain `keepawake` while running just shows where things stand.
+    if [[ -z "$TIME_KIND" && -z "$NEW_MODE" ]]; then
+        clean_stale
+        if is_running; then status_human; return; fi
+        TIME_KIND=forever
+    fi
+
+    apply
+}
+
+# Sourcing (tests) defines the functions without running anything.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"

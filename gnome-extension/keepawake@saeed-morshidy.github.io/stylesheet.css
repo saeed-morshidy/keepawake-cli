@@ -1,0 +1,35 @@
+.keepawake-panel-label {
+    padding-left: 4px;
+    font-feature-settings: "tnum";
+}
+
+.keepawake-status {
+    color: rgba(255, 255, 255, 0.7);
+    font-feature-settings: "tnum";
+}
+
+.keepawake-chips {
+    spacing: 6px;
+}
+
+.keepawake-chip {
+    padding: 6px 0;
+    border-radius: 99px;
+    background-color: rgba(255, 255, 255, 0.08);
+    font-weight: bold;
+    font-feature-settings: "tnum";
+}
+
+.keepawake-chip:hover,
+.keepawake-chip:focus {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+.keepawake-chip:active {
+    background-color: rgba(255, 255, 255, 0.24);
+}
+
+.keepawake-chip:checked {
+    background-color: -st-accent-color;
+    color: -st-accent-fg-color;
+}
