@@ -1,35 +1,89 @@
+/* Panel ----------------------------------------------------------------- */
+
 .keepawake-panel-label {
-    padding-left: 4px;
-    font-feature-settings: "tnum";
-}
-
-.keepawake-status {
-    color: rgba(255, 255, 255, 0.7);
-    font-feature-settings: "tnum";
-}
-
-.keepawake-chips {
-    spacing: 6px;
-}
-
-.keepawake-chip {
-    padding: 6px 0;
-    border-radius: 99px;
-    background-color: rgba(255, 255, 255, 0.08);
+    padding-left: 5px;
     font-weight: bold;
     font-feature-settings: "tnum";
 }
 
-.keepawake-chip:hover,
-.keepawake-chip:focus {
-    background-color: rgba(255, 255, 255, 0.16);
+.keepawake-panel-label.keepawake-infinite {
+    font-size: 1.25em;
 }
 
-.keepawake-chip:active {
-    background-color: rgba(255, 255, 255, 0.24);
+/* Menu ------------------------------------------------------------------ */
+
+.keepawake-menu {
+    min-width: 304px;
 }
 
-.keepawake-chip:checked {
+.keepawake-header {
+    spacing: 12px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+}
+
+.keepawake-header-icon {
+    icon-size: 24px;
+}
+
+.keepawake-title {
+    font-weight: bold;
+}
+
+.keepawake-subtitle,
+.keepawake-until,
+.keepawake-section-label {
+    font-size: 0.9em;
+}
+
+.keepawake-timer {
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+
+.keepawake-countdown {
+    font-size: 2.2em;
+    font-weight: bold;
+    font-feature-settings: "tnum";
+}
+
+.keepawake-section {
+    padding-top: 6px;
+    padding-bottom: 2px;
+}
+
+.keepawake-section-label {
+    font-weight: bold;
+}
+
+.keepawake-row {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+/* One button style for every row: same height, same text size. */
+.keepawake-buttons {
+    spacing: 6px;
+}
+
+.keepawake-button {
+    min-height: 32px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background-color: rgba(127, 127, 127, 0.18);
+    font-feature-settings: "tnum";
+}
+
+.keepawake-button:hover,
+.keepawake-button:focus {
+    background-color: rgba(127, 127, 127, 0.32);
+}
+
+.keepawake-button:active {
+    background-color: rgba(127, 127, 127, 0.45);
+}
+
+.keepawake-button:checked {
     background-color: -st-accent-color;
     color: -st-accent-fg-color;
 }

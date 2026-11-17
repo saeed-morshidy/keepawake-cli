@@ -81,15 +81,23 @@ Exit codes: `0` ok · `1` failure · `2` bad arguments · `3` `status` while off
 
 ## Top bar
 
-- The cup has steam when keepawake is on, is dimmed on *standby*, and shows
-  the time left next to it (`1h05m`, `25m`, `40s`).
-- **Switch** — on/off. **15m · 30m · 1h · 2h · 4h · ∞** — start or re-time in one
-  click. **+15m · +30m · +1h** — extend while running.
-- **Power** — AC + battery, AC only, battery only.
-- **Middle-click** the icon to toggle without opening the menu.
+- **In the bar:** an empty cup when off. When on, a cup with steam and the time
+  left next to it — `1:24:05`, `12:30`, or `∞` with no limit. Dimmed while on
+  *standby* (waiting for the right power source).
+- **Header** — click the row to turn it on (no limit) or off. The line under
+  the title says what is happening right now.
+- **Countdown** — large time left and when it ends, with **+15m · +30m · +1h**.
+- **Keep awake for / Change timer** — **15m · 30m · 1h · 2h · 4h** starts a timer,
+  or restarts the running one at that length.
+- **Power** — **Any power · AC · Battery**, applied at once if running.
+
+The menu stays open while you click, so you see each change land.
 
 The icon only runs the `keepawake` command, so the terminal and the bar always
 show the same thing.
+
+`make ui-test` starts a throwaway headless GNOME Shell, clicks every control
+with real pointer events and checks the result (`tests/ui/`).
 
 ## How it works
 

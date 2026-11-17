@@ -3,6 +3,9 @@
 // The extension never touches power settings itself. It reads the small state
 // files the CLI keeps in $XDG_RUNTIME_DIR/keepawake and runs `keepawake ...`
 // for every action, so the bar and the terminal always agree.
+//
+// Rule that keeps it honest: the UI only *shows* state. Nothing that renders
+// state may trigger an action — actions come from clicks only.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -15,20 +18,15 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const PRESETS = [
-    ['15m', '15m'],
-    ['30m', '30m'],
-    ['1h', '1h'],
-    ['2h', '2h'],
-    ['4h', '4h'],
-    ['∞', 'forever'],
-];
+const PRESETS = ['15m', '30m', '1h', '2h', '4h'];
 const EXTENDS = ['+15m', '+30m', '+1h'];
 const MODES = [
-    ['both', 'AC + battery'],
-    ['ac', 'AC only'],
-    ['battery', 'Battery only'],
+    ['both', 'Any power'],
+    ['ac', 'AC'],
+    ['battery', 'Battery'],
 ];
+const DIM = 170; // opacity for secondary text; works on light and dark themes
+const NO_ORNAMENT = PopupMenu.Ornament.HIDDEN ?? PopupMenu.Ornament.NONE;
 
 function readKv(path) {
     try {
@@ -47,47 +45,90 @@ function readKv(path) {
     }
 }
 
-function fmtShort(s) {
+// 5025 -> "1:23:45", 754 -> "12:34"
+function fmtTimer(s) {
     s = Math.max(0, s);
-    if (s >= 3600)
-        return `${Math.floor(s / 3600)}h${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}m`;
-    if (s >= 60)
-        return `${Math.ceil(s / 60)}m`;
-    return `${s}s`;
-}
-
-function fmtLong(s) {
-    s = Math.max(0, s);
-    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
-    if (h)
-        return `${h}h ${String(m).padStart(2, '0')}m`;
-    if (m)
-        return `${m}m ${String(sec).padStart(2, '0')}s`;
-    return `${sec}s`;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor(s % 3600 / 60);
+    const sec = String(s % 60).padStart(2, '0');
+    return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
 }
 
 function fmtClock(epoch) {
     const d = GLib.DateTime.new_from_unix_local(epoch);
-    const today = GLib.DateTime.new_now_local();
-    const sameDay = d.get_day_of_year() === today.get_day_of_year() &&
-        d.get_year() === today.get_year();
+    const now = GLib.DateTime.new_now_local();
+    const sameDay = d.get_day_of_year() === now.get_day_of_year() &&
+        d.get_year() === now.get_year();
     return d.format(sameDay ? '%H:%M' : '%a %H:%M');
 }
+
+function vbox(params = {}) {
+    const box = new St.BoxLayout(params);
+    if ('orientation' in box)
+        box.orientation = Clutter.Orientation.VERTICAL;
+    else
+        box.vertical = true;
+    return box;
+}
+
+function plainItem(styleClass) {
+    const item = new PopupMenu.PopupBaseMenuItem({
+        reactive: false,
+        can_focus: false,
+        style_class: styleClass,
+    });
+    item.setOrnament(NO_ORNAMENT);
+    return item;
+}
+
+// Header: icon, title + one-line status, and an on/off switch. The whole row
+// is the toggle; the switch only mirrors the state.
+const HeaderItem = GObject.registerClass(
+class KeepawakeHeaderItem extends PopupMenu.PopupBaseMenuItem {
+    _init(onToggle) {
+        super._init({style_class: 'keepawake-header'});
+        this.setOrnament(NO_ORNAMENT);
+        this._onToggle = onToggle;
+
+        this.icon = new St.Icon({style_class: 'keepawake-header-icon', y_align: Clutter.ActorAlign.CENTER});
+        this.add_child(this.icon);
+
+        const text = vbox({x_expand: true, y_align: Clutter.ActorAlign.CENTER});
+        this.title = new St.Label({text: 'Keep awake', style_class: 'keepawake-title'});
+        this.subtitle = new St.Label({style_class: 'keepawake-subtitle'});
+        this.subtitle.opacity = DIM;
+        text.add_child(this.title);
+        text.add_child(this.subtitle);
+        this.add_child(text);
+        this.label_actor = this.title;
+
+        this.switch = new PopupMenu.Switch(false);
+        this.switch.reactive = false; // clicks go to the row
+        this.switch.y_align = Clutter.ActorAlign.CENTER;
+        this.add_child(this.switch);
+    }
+
+    activate(_event) {
+        // Don't call super: the menu stays open so the result is visible.
+        this._onToggle(!this.switch.state);
+    }
+});
 
 const KeepawakeIndicator = GObject.registerClass(
 class KeepawakeIndicator extends PanelMenu.Button {
     _init(ext) {
         super._init(0.5, 'Keepawake');
-        this._ext = ext;
         this._state = {running: false};
+        this._mode = 'both';  // used for the next start
+        this._busy = false;
         this._tickId = 0;
 
-        this._iconOn = Gio.FileIcon.new(
-            ext.dir.resolve_relative_path('icons/keepawake-on-symbolic.svg'));
-        this._iconOff = Gio.FileIcon.new(
-            ext.dir.resolve_relative_path('icons/keepawake-off-symbolic.svg'));
+        const icon = name => Gio.FileIcon.new(ext.dir.resolve_relative_path(`icons/${name}.svg`));
+        this._iconOn = icon('keepawake-on-symbolic');
+        this._iconOff = icon('keepawake-off-symbolic');
 
-        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        // Panel: cup + time left
+        const box = new St.BoxLayout({style_class: 'panel-status-menu-box keepawake-panel'});
         this._icon = new St.Icon({gicon: this._iconOff, style_class: 'system-status-icon'});
         this._label = new St.Label({
             style_class: 'keepawake-panel-label',
@@ -99,84 +140,79 @@ class KeepawakeIndicator extends PanelMenu.Button {
         this.add_child(box);
 
         this._buildMenu();
-
         this._watchState();
         this._refresh();
-    }
-
-    // Middle click toggles without opening the menu.
-    vfunc_event(event) {
-        if (event.type() === Clutter.EventType.BUTTON_PRESS &&
-            event.get_button() === Clutter.BUTTON_MIDDLE) {
-            this._run(this._state.running ? ['stop'] : ['forever']);
-            return Clutter.EVENT_STOP;
-        }
-        return super.vfunc_event(event);
     }
 
     // ── menu ──────────────────────────────────────────────────────────────
 
     _buildMenu() {
-        this._switch = new PopupMenu.PopupSwitchMenuItem('Keep awake', false);
-        this._switch.connect('toggled', (_i, on) => this._run(on ? ['forever'] : ['stop']));
-        this.menu.addMenuItem(this._switch);
+        this.menu.box.add_style_class_name('keepawake-menu');
 
-        this._status = new PopupMenu.PopupMenuItem('', {reactive: false, can_focus: false});
-        this._status.label.add_style_class_name('keepawake-status');
-        this.menu.addMenuItem(this._status);
+        this._header = new HeaderItem(on => this._run(on ? ['forever'] : ['stop']));
+        this.menu.addMenuItem(this._header);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Keep awake for'));
-        this._presetButtons = this._chipRow(this.menu, PRESETS, arg => this._run([arg]));
+        // Countdown, only while running
+        this._timerItem = plainItem('keepawake-timer');
+        const tbox = vbox({x_expand: true});
+        this._countdown = new St.Label({style_class: 'keepawake-countdown', x_align: Clutter.ActorAlign.CENTER});
+        this._until = new St.Label({style_class: 'keepawake-until', x_align: Clutter.ActorAlign.CENTER});
+        this._until.opacity = DIM;
+        tbox.add_child(this._countdown);
+        tbox.add_child(this._until);
+        this._timerItem.add_child(tbox);
+        this.menu.addMenuItem(this._timerItem);
 
-        this._extendItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        this._extendButtons = this._chips(this._extendItem,
-            EXTENDS.map(e => [e, e]), arg => this._run([arg]));
-        this.menu.addMenuItem(this._extendItem);
+        this._extend = this._buttonRow(EXTENDS.map(e => [e, e]), arg => this._run([arg]));
+        this.menu.addMenuItem(this._extend.item);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._modeMenu = new PopupMenu.PopupSubMenuMenuItem('Power');
-        this._modeItems = {};
-        for (const [mode, label] of MODES) {
-            const item = new PopupMenu.PopupMenuItem(label);
-            item.connect('activate', () => this._setMode(mode));
-            this._modeMenu.menu.addMenuItem(item);
-            this._modeItems[mode] = item;
-        }
-        this.menu.addMenuItem(this._modeMenu);
-        this._pendingMode = 'both';
 
-        // Keep the countdown in the menu live while it is open.
-        this.menu.connect('open-state-changed', () => this._render());
+        this._timerTitle = this._section('Keep awake for');
+        this._presets = this._buttonRow(PRESETS.map(p => [p, p]), arg => this._run([arg]));
+        this.menu.addMenuItem(this._presets.item);
+
+        this._section('Power');
+        this._modes = this._buttonRow(MODES, mode => this._setMode(mode));
+        this.menu.addMenuItem(this._modes.item);
+
+        this.menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this._refresh();
+        });
     }
 
-    _chipRow(menu, entries, onClick) {
-        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        const buttons = this._chips(item, entries, onClick);
-        menu.addMenuItem(item);
-        return buttons;
+    _section(text) {
+        const item = plainItem('keepawake-section');
+        const label = new St.Label({text, style_class: 'keepawake-section-label'});
+        label.opacity = DIM;
+        item.add_child(label);
+        this.menu.addMenuItem(item);
+        return label;
     }
 
-    _chips(item, entries, onClick) {
-        const row = new St.BoxLayout({style_class: 'keepawake-chips', x_expand: true});
-        const buttons = [];
-        for (const [label, arg] of entries) {
+    _buttonRow(entries, onClick) {
+        const item = plainItem('keepawake-row');
+        const row = new St.BoxLayout({style_class: 'keepawake-buttons', x_expand: true});
+        row.layout_manager.homogeneous = true; // equal-width buttons
+        const buttons = new Map();
+        for (const [arg, label] of entries) {
             const b = new St.Button({
                 label,
-                style_class: 'keepawake-chip',
+                style_class: 'keepawake-button',
                 can_focus: true,
                 x_expand: true,
             });
             b.connect('clicked', () => onClick(arg));
-            b._arg = arg;
             row.add_child(b);
-            buttons.push(b);
+            buttons.set(arg, b);
         }
         item.add_child(row);
-        return buttons;
+        return {item, buttons};
     }
 
     _setMode(mode) {
-        this._pendingMode = mode;
+        this._mode = mode;
         if (this._state.running)
             this._run(['mode', mode]);
         else
@@ -216,10 +252,9 @@ class KeepawakeIndicator extends PanelMenu.Button {
                 mode: cfg.MODE || 'both',
                 deadline: parseInt(cfg.DEADLINE) || 0,
             };
-            this._pendingMode = this._state.mode;
+            this._mode = this._state.mode;
         } else if (cfg && !rt) {
-            // Starting up: the service has not reported yet. Keep the old view.
-            return;
+            return; // starting: the service hasn't reported yet
         } else {
             this._state = {running: false};
         }
@@ -243,39 +278,44 @@ class KeepawakeIndicator extends PanelMenu.Button {
     _render() {
         const s = this._state;
         const now = Math.floor(Date.now() / 1000);
-        const left = s.running && s.deadline > 0 ? s.deadline - now : null;
+        const timed = s.running && s.deadline > 0;
+        const left = timed ? s.deadline - now : 0;
+        const standby = s.running && !s.protected;
+        const waitingFor = s.mode === 'ac' ? 'AC' : 'battery';
 
         // Panel
         this._icon.gicon = s.running ? this._iconOn : this._iconOff;
-        this._icon.opacity = s.running && !s.protected ? 128 : 255;
-        if (left !== null) {
-            this._label.text = fmtShort(left);
-            this._label.show();
-        } else {
-            this._label.hide();
-        }
-
-        // Menu
-        this._switch.setToggleState(!!s.running);
-        if (!s.running)
-            this._status.label.text = 'Off — normal power settings';
-        else if (!s.protected)
-            this._status.label.text = `Standby — waiting for ${s.mode === 'ac' ? 'AC' : 'battery'} power`;
-        else if (left !== null)
-            this._status.label.text = `${fmtLong(left)} left · until ${fmtClock(s.deadline)}`;
+        this._icon.opacity = standby ? 128 : 255;
+        this._label.visible = s.running;
+        this._label.text = timed ? fmtTimer(left) : '∞';
+        if (timed)
+            this._label.remove_style_class_name('keepawake-infinite');
         else
-            this._status.label.text = 'On — until you turn it off';
+            this._label.add_style_class_name('keepawake-infinite');
+        this._label.opacity = standby ? 128 : 255;
 
-        this._extendItem.visible = !!s.running;
+        // Header
+        const h = this._header;
+        h.icon.gicon = s.running ? this._iconOn : this._iconOff;
+        h.switch.state = !!s.running;
+        if (!s.running)
+            h.subtitle.text = 'Off';
+        else if (standby)
+            h.subtitle.text = `Standby — waiting for ${waitingFor} power`;
+        else
+            h.subtitle.text = `On · ${s.power === 'battery' ? 'on battery' : 'plugged in'}`;
 
-        const mode = s.running ? s.mode : this._pendingMode;
-        for (const [m, item] of Object.entries(this._modeItems))
-            item.setOrnament(m === mode ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-        this._modeMenu.label.text = `Power: ${MODES.find(([m]) => m === mode)[1]}`;
+        // Countdown
+        this._timerItem.visible = !!s.running;
+        this._countdown.text = timed ? fmtTimer(left) : 'No limit';
+        this._until.text = timed ? `left · ends at ${fmtClock(s.deadline)}` : 'until you turn it off';
+        this._extend.item.visible = timed;
 
-        for (const b of this._presetButtons) {
-            const active = s.running && b._arg === 'forever' && !s.deadline;
-            if (active)
+        this._timerTitle.text = s.running ? 'Change timer' : 'Keep awake for';
+
+        const mode = s.running ? s.mode : this._mode;
+        for (const [m, b] of this._modes.buttons) {
+            if (m === mode)
                 b.add_style_pseudo_class('checked');
             else
                 b.remove_style_pseudo_class('checked');
@@ -290,9 +330,11 @@ class KeepawakeIndicator extends PanelMenu.Button {
     }
 
     _run(args) {
-        // A fresh start takes the mode picked in the menu.
+        if (this._busy)
+            return;
+        // A fresh start uses the power mode picked in the menu.
         if (!this._state.running && args[0] !== 'stop' && args[0] !== 'mode')
-            args = [...args, this._pendingMode];
+            args = [...args, this._mode];
 
         let proc;
         try {
@@ -302,11 +344,13 @@ class KeepawakeIndicator extends PanelMenu.Button {
             Main.notifyError('Keepawake', `Could not run keepawake: ${e.message}`);
             return;
         }
+        this._busy = true;
         proc.communicate_utf8_async(null, null, (p, res) => {
+            this._busy = false;
             try {
                 const [, , stderr] = p.communicate_utf8_finish(res);
-                if (!p.get_successful() && stderr?.trim())
-                    Main.notifyError('Keepawake', stderr.trim().replace(/^✗\s*/, ''));
+                if (!p.get_successful())
+                    Main.notifyError('Keepawake', stderr?.trim().replace(/^✗\s*/, '') || 'keepawake failed');
             } catch (e) {
                 logError(e, 'keepawake');
             }

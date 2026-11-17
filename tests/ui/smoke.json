@@ -1,0 +1,41 @@
+[
+  ["cmd", "keepawake stop"],
+  ["expect-panel", "^$", "off: no time in the bar"],
+  ["panel"], ["wait", 500], ["shot", "01-menu-off"],
+
+  ["click", "30m"], ["wait", 2500],
+  ["expect", {"running": true, "deadline-set": true}, "preset starts a timer"],
+  ["expect-panel", "^(29|30):[0-5][0-9]$", "time shows in the bar"],
+  ["shot", "02-menu-30m"],
+
+  ["click", "+15m"], ["wait", 1500],
+  ["expect", {"running": true, "deadline-set": true}, "+15m keeps the timer"],
+  ["expect-panel", "^4[45]:[0-5][0-9]$", "+15m extends"],
+
+  ["click", "1h"], ["wait", 1500],
+  ["expect-panel", "^(59:[0-5][0-9]|1:00:00)$", "1h re-times while running"],
+
+  ["click", "AC"], ["wait", 2500],
+  ["expect", {"running": true, "mode": "ac", "deadline-set": true}, "mode switch keeps timer"],
+
+  ["click", "Keep awake"], ["wait", 2000],
+  ["expect", {"running": false}, "header switch turns off"],
+
+  ["click", "Keep awake"], ["wait", 2500],
+  ["expect", {"running": true, "mode": "ac", "deadline-set": false}, "header switch turns on, no limit"],
+  ["expect-panel", "^∞$", "no-limit shows ∞"],
+  ["shot", "03-menu-forever"],
+
+  ["click", "Any power"], ["wait", 2500],
+  ["expect", {"running": true, "mode": "both"}, "mode back to any"],
+
+  ["panel"], ["wait", 400],
+  ["expect", {"running": true}, "closing the menu changes nothing"],
+  ["shot", "04-panel-on"],
+
+  ["cmd", "keepawake 1h"], ["wait", 1500],
+  ["expect-panel", "^(59:[0-5][0-9]|1:00:00)$", "CLI changes show in the bar"],
+
+  ["cmd", "keepawake stop"], ["wait", 1200],
+  ["expect-panel", "^$", "CLI stop clears the bar"]
+]

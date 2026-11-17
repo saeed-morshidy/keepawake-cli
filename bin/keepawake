@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly UNIT="keepawake.service"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SELF

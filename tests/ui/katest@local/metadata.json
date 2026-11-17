@@ -1,0 +1,6 @@
+{
+  "uuid": "katest@local",
+  "name": "keepawake UI test driver",
+  "description": "Drives the keepawake indicator with real pointer events in a headless shell. Test-only.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
+}

@@ -1,4 +1,4 @@
-.PHONY: install uninstall test lint zip
+.PHONY: install uninstall test ui-test lint zip
 
 install:
 	./install.sh
@@ -9,8 +9,12 @@ uninstall:
 test:
 	bash tests/run.sh
 
+# Drives the top-bar extension in a headless GNOME Shell (needs a GNOME desktop).
+ui-test:
+	tests/ui/run.sh
+
 lint:
-	shellcheck -x bin/keepawake install.sh tests/run.sh
+	shellcheck -x bin/keepawake install.sh tests/run.sh tests/ui/run.sh
 
 # Package the extension for extensions.gnome.org
 zip:

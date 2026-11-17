@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.0 — 2026-11-17
+
+Top-bar extension, rebuilt after testing on GNOME 50:
+
+- **Fix: controls fought each other.** On GNOME 50 a switch fires its
+  "toggled" signal when its state is *set*, so every refresh re-ran start/stop:
+  timers turned into "no limit" and stops were undone. The UI now only shows
+  state; actions come from clicks only.
+- **Fix: errors on every pointer event** (a removed GNOME 50 virtual function).
+- Time always shown in the bar while on: `1:24:05`, `12:30` or `∞`.
+- Cup icon redrawn at full size, as fills (the shell's symbolic renderer drops
+  strokes) — matches the icons next to it.
+- Tidy menu: header row with switch, large countdown, equal-width buttons in
+  one style, power as a three-way choice; the menu stays open while you click.
+- `tests/ui/`: headless GNOME Shell test that clicks every control with real
+  pointer events (`make ui-test`).
+
 ## 2.0.0 — 2026-11-15
 
 - **Live re-timing.** While running, `keepawake 2h` restarts the countdown,

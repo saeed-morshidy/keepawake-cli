@@ -2,7 +2,15 @@
   "uuid": "keepawake@saeed-morshidy.github.io",
   "name": "Keepawake",
   "description": "Top-bar control for the keepawake CLI: see the remaining time, start, re-time, extend or stop keeping the machine awake.",
-  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
   "url": "https://github.com/saeed-morshidy/keepawake-cli",
-  "version": 1
+  "version": 2
 }
